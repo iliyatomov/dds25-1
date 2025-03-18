@@ -2,6 +2,7 @@ import logging
 import os
 import atexit
 import uuid
+import asyncio
 
 import redis
 
@@ -51,6 +52,40 @@ async def get_item_from_db(item_id: str) -> StockValue | None:
         # if item does not exist in the database; abort
         abort(400, f"Item: {item_id} not found!")
     return entry
+
+@app.before_serving
+async def startup():
+    await rabbit_client.start()
+
+    asyncio.create_task(rabbit_client.subscribe(f'order-paid-*', on_order_paid))
+
+
+async def on_order_paid(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=OrderPaidEvent)
+
+    async with db.pipeline(transaction=True) as pipe:
+        stock_values = {}
+
+        for item_id, quantity in event.items:
+            stock_entry = await get_item_from_db(item_id)
+            if not stock_entry:
+                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
+                                                      total_cost=event.total_cost,
+                                                      order_handling_service_id=event.order_handling_service_id)
+                await rabbit_client.publish(f"insufficient-stock-{event.order_handling_service_id}", insuff_event)
+                return
+
+            new_stock = stock_entry.stock - quantity
+            if new_stock < 0:
+                app.logger.error(f"Insufficient stock for item {item_id}!")
+                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
+                                                      total_cost=event.total_cost,
+                                                      order_handling_service_id=event.order_handling_service_id)
+                await rabbit_client.publish(f"insufficient-stock-{event.order_handling_service_id}", insuff_event)
+                return
+
+            stock_values[item_id] = new_stock
+
 
 
 @app.post('/item/create/<price>')
