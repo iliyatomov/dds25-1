@@ -22,8 +22,10 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
-      - message-bus
+      message-bus:
+        condition: service_healthy
+      order-db:
+        condition: service_started
 
   order-db:
     image: redis:7.2-bookworm
@@ -32,7 +34,10 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - GATEWAY_URL=http://gateway:80\
+      - RABBIT_URL=amqp://guest:guest@message-bus:5672/
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -45,7 +50,10 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - GATEWAY_URL=http://gateway:80\
+      - RABBIT_URL=amqp://guest:guest@message-bus:5672/
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -63,3 +71,8 @@ services:
     volumes:
         - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
         - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
