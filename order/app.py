@@ -4,7 +4,6 @@ import os
 import atexit
 import random
 import uuid
-from collections import defaultdict
 
 import redis.asyncio as redis
 import requests
@@ -12,7 +11,8 @@ import requests
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-from rabbit_client import RabbitClient
+from infrastructure import RabbitClient, IncomingMessage, EventWaiter
+from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -28,12 +28,13 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 
 rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 
+service_id = uuid.uuid4()
+event_waiter = EventWaiter()
+
 async def close_db_connection():
     await db.close()
 
-
 atexit.register(close_db_connection)
-
 
 class OrderValue(Struct):
     paid: bool
@@ -58,6 +59,50 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
 async def startup():
     await rabbit_client.start()
 
+    asyncio.create_task(rabbit_client.subscribe(f'stock-reserved-{service_id}', on_stock_reserved))
+    asyncio.create_task(rabbit_client.subscribe(f'order-cancelled-{service_id}', on_order_cancelled))
+
+
+async def on_stock_reserved(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=StockReservedEvent)
+
+    async with db.pipeline() as pipe:
+        while True:
+            try:
+                await pipe.watch(event.order_id)
+
+                entry = await pipe.get(event.order_id)
+                entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+                if entry is None:
+                    await message.ack()
+                    await pipe.unwatch()
+                    event_waiter.trigger_event(event.order_id, None) 
+                    return
+
+                entry.paid = True
+
+                pipe.multi()
+                await pipe.set(event.order_id, msgpack.encode(entry))
+
+                await pipe.execute()
+                break
+            except redis.WatchError:
+                continue
+            finally:
+                await pipe.unwatch()
+    
+    event_waiter.trigger_event(event.order_id, entry) # TODO: consider reverting order if trigger_event returns False
+    
+    await message.ack()
+
+
+async def on_order_cancelled(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=OrderCancelledEvent)
+
+    event_waiter.trigger_event(event.order_id, None)
+
+    await message.ack()
+    
 @app.post('/create/<user_id>')
 async def create_order(user_id: str):
     key = str(uuid.uuid4())
@@ -110,15 +155,6 @@ async def find_order(order_id: str):
     )
 
 
-async def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
 async def send_get_request(url: str):
     try:
         response = requests.get(url)
@@ -146,39 +182,18 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-async def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        await send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = await get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = await send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            await rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = await send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        await rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        await db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+
+    event = OrderPlacedEvent(order_id=order_id, user_id=order_entry.user_id, items=order_entry.items, total_cost=order_entry.total_cost, order_handling_service_id=service_id)
+    await rabbit_client.publish(f'order-placed-{service_id}', event)
+
+    data = await event_waiter.wait_for_event(order_id)
+    if data is None:
+        abort(400, "Checkout failed")
+
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 

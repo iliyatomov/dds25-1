@@ -4,6 +4,7 @@ import aio_pika
 from aio_pika import IncomingMessage, Message, RobustConnection
 import aio_pika.abc
 import json
+from msgspec import msgpack
 
 from typing import Any, Awaitable, Callable
 
@@ -29,7 +30,7 @@ class RabbitClient:
     async def publish(self, routing_key: str, message: dict):
         await self.channel.default_exchange.publish(
             Message(
-                body=json.dumps(message).encode(),
+                body=msgpack.encode(message),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT
             ),
             routing_key
