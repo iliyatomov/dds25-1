@@ -9,6 +9,7 @@ from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
 from infrastructure import RabbitClient, IncomingMessage, EventWaiter
+from events import StockReservedEvent, OrderPaidEvent, InsufficientStockEvent
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"

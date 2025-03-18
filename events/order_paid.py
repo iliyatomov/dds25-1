@@ -1,6 +1,6 @@
 from msgspec import Struct
 
-class OrderPayedEvent(Struct):
+class OrderPaidEvent(Struct):
     order_id: str
     user_id: str
     items: list[tuple[str, int]]
