@@ -22,8 +22,10 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
-      - message-bus
+      message-bus:
+        condition: service_healthy
+      order-db:
+        condition: service_started
 
   order-db:
     image: redis:7.2-bookworm
@@ -63,3 +65,8 @@ services:
     volumes:
         - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
         - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
