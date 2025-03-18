@@ -86,6 +86,22 @@ async def on_order_paid(message: IncomingMessage):
 
             stock_values[item_id] = new_stock
 
+        try:
+            for item_id, new_stock in stock_values.items():
+                stock_entry = await get_item_from_db(item_id)
+                stock_entry.stock = new_stock
+                pipe.set(item_id, msgpack.encode(stock_entry))
+
+            await pipe.execute()
+            succ_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
+                                                total_cost=event.total_cost,
+                                                order_handling_service_id=event.order_handling_service_id)
+            await rabbit_client.publish(f"stock-reserved-{event.order_handling_service_id}", succ_event)
+
+
+        except redis.exceptions.RedisError as e:
+            return abort(400, DB_ERROR_STR)
+
 
 
 @app.post('/item/create/<price>')
