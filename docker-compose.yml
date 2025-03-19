@@ -41,7 +41,10 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      message-bus:
+        condition: service_healthy
+      stock-db:
+        condition: service_started
 
   stock-db:
     image: redis:7.2-bookworm
@@ -57,7 +60,10 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      message-bus:
+        condition: service_healthy
+      payment-db:
+        condition: service_started
 
   payment-db:
     image: redis:7.2-bookworm
