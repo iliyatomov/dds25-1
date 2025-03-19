@@ -10,13 +10,16 @@ from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
 from infrastructure import RabbitClient, IncomingMessage, EventWaiter
-from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent
+from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent, OrderPaidEvent
 
 DB_ERROR_STR = "DB error"
 
 
 rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 app = Quart("payment-service")
+
+service_id = uuid.uuid4()
+event_waiter = EventWaiter()
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -52,6 +55,47 @@ async def get_user_from_db(user_id: str) -> UserValue | None:
 @app.before_serving
 async def startup():
     await rabbit_client.start()
+
+    asyncio.create_task(rabbit_client.subscribe(f'order-placed-{service_id}', on_order_placed))
+
+
+async def on_order_placed(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=OrderPlacedEvent)
+    user_id = event.user_id
+    total_cost = event.total_cost
+
+    async with db.pipeline() as pipe:
+        while True:
+            try:
+                await pipe.watch(user_id)
+
+                user_credit = await pipe.get(user_id)
+                user_credit = msgpack.decode(user_credit, type=UserValue) if user_credit else None
+
+                if user_credit >= total_cost:
+                    new_credit = user_credit - total_cost
+
+                    pipe.multi()
+                    await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
+
+                    await pipe.execute()
+                    order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost)
+                    await rabbit_client.publish(f'order-paid-{event.order_handling_service_id}', order_paid_event)
+
+                else:
+                    order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost)
+                    await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+
+                break
+
+            except redis.WatchError:
+                continue
+            finally:
+                await pipe.unwatch()
+
+    await message.ack()
+
+
 
 @app.post('/create_user')
 async def create_user():
