@@ -10,7 +10,7 @@ from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
 from infrastructure import RabbitClient, IncomingMessage, EventWaiter
-from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent, OrderPaidEvent
+from events import OrderPlacedEvent, OrderCancelledEvent, OrderPaidEvent, InsufficientStockEvent
 
 DB_ERROR_STR = "DB error"
 
@@ -57,6 +57,7 @@ async def startup():
     await rabbit_client.start()
 
     asyncio.create_task(rabbit_client.subscribe(f'order-placed-{service_id}', on_order_placed))
+    asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock-{service_id}', on_insufficient_stock))
 
 
 async def on_order_placed(message: IncomingMessage):
@@ -95,6 +96,40 @@ async def on_order_placed(message: IncomingMessage):
 
     await message.ack()
 
+async def on_insufficient_stock(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=InsufficientStockEvent)
+    user_id = event.user_id
+    total_cost = event.total_cost
+
+    async with db.pipeline() as pipe:
+        while True:
+            try:
+                await pipe.watch(user_id)
+
+                user_credit = await pipe.get(user_id)
+                user_credit = int(user_credit) if user_credit else 0
+
+                new_credit = user_credit + total_cost
+
+                pipe.multi()
+
+                # update the credit
+                await pipe.set(user_id, new_credit)
+
+                await pipe.execute()
+
+                order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id)
+
+                # send order cancelled event
+                await rabbit_client.publish('order-cancelled', msgpack.encode(order_cancelled_event))
+
+                break
+            except redis.WatchError:
+                continue
+            finally:
+                await pipe.unwatch()
+
+    await message.ack()
 
 
 @app.post('/create_user')
