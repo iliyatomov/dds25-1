@@ -110,7 +110,7 @@ async def create_item(price: int):
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        await db.set(key, value)
+        db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
