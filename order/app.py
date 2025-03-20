@@ -66,33 +66,23 @@ async def startup():
 async def on_stock_reserved(message: IncomingMessage):
     event = msgpack.decode(message.body, type=StockReservedEvent)
 
-    async with db.pipeline() as pipe:
-        while True:
-            try:
-                await pipe.watch(event.order_id)
+    async def transaction_logic(pipe):
+        entry = await pipe.get(event.order_id)
+        entry = msgpack.decode(entry, type=OrderValue) if entry else None
+        if entry is None:
+            event_waiter.trigger_event(event.order_id, None) 
+            return
 
-                entry = await pipe.get(event.order_id)
-                entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-                if entry is None:
-                    await message.ack()
-                    await pipe.unwatch()
-                    event_waiter.trigger_event(event.order_id, None) 
-                    return
+        entry.paid = True
 
-                entry.paid = True
+        pipe.multi()
+        await pipe.set(event.order_id, msgpack.encode(entry))
 
-                pipe.multi()
-                await pipe.set(event.order_id, msgpack.encode(entry))
+    async with db.client() as client:
+        await client.transaction(transaction_logic, event.order_id)
 
-                await pipe.execute()
-                break
-            except redis.WatchError:
-                continue
-            finally:
-                await pipe.unwatch()
-    
-    event_waiter.trigger_event(event.order_id, entry) # TODO: consider reverting order if trigger_event returns False
-    
+    event_waiter.trigger_event(event.order_id, event.order_id) # TODO: consider reverting order if trigger_event returns False
+
     await message.ack()
 
 

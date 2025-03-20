@@ -59,51 +59,44 @@ async def startup():
 async def on_order_paid(message: IncomingMessage):
     event = msgpack.decode(message.body, type=OrderPaidEvent)
 
-    async with db.pipeline(transaction=True) as pipe:
+    async def transaction_logic(pipe):
         stock_values = {}
 
-        for item_id, quantity in event.items:
-            stock_entry = await get_item_from_db(item_id)
+        item_ids = [str(item_id) for item_id, _ in event.items]
+
+        stock_entries = await pipe.mget(item_ids)
+        stock_entries = [msgpack.decode(entry, type=StockValue) if entry else None for entry in stock_entries]
+
+        for (item_id, quantity), stock_entry in zip(event.items, stock_entries):
             if not stock_entry:
-                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
-                                                      total_cost=event.total_cost,
+                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id,
+                                                      items=event.items, total_cost=event.total_cost,
                                                       order_handling_service_id=event.order_handling_service_id)
-                
                 await rabbit_client.publish("insufficient-stock", insuff_event)
-                await message.ack()
                 return
 
             new_stock = stock_entry.stock - quantity
             if new_stock < 0:
-                app.logger.error(f"Insufficient stock for item {item_id}!")
-                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
-                                                      total_cost=event.total_cost,
+                insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id,
+                                                      items=event.items, total_cost=event.total_cost,
                                                       order_handling_service_id=event.order_handling_service_id)
-
                 await rabbit_client.publish("insufficient-stock", insuff_event)
-                await message.ack()
                 return
 
-            stock_values[item_id] = new_stock
+            stock_values[item_id] = StockValue(stock=new_stock, price=stock_entry.price)
 
-        try:
-            for item_id, new_stock in stock_values.items():
-                stock_entry = await get_item_from_db(item_id)
-                stock_entry.stock = new_stock
-                pipe.set(item_id, msgpack.encode(stock_entry))
+        pipe.multi()
+        kv_pairs: dict[str, bytes] = {f"{item_id}": msgpack.encode(stock_value) for (item_id, stock_value) in stock_values.items()}
+        await pipe.mset(kv_pairs)
 
-            await pipe.execute()
-            succ_event = StockReservedEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
-                                                total_cost=event.total_cost,
-                                                order_handling_service_id=event.order_handling_service_id)
+        succ_event = StockReservedEvent(order_id=event.order_id, user_id=event.user_id,
+                                        items=event.items, total_cost=event.total_cost,
+                                        order_handling_service_id=event.order_handling_service_id)
+        await rabbit_client.publish(f"stock-reserved-{event.order_handling_service_id}", succ_event)
 
-            await rabbit_client.publish(f"stock-reserved-{event.order_handling_service_id}", succ_event)
-            await message.ack()
-
-        except redis.exceptions.RedisError as e:
-            return abort(400, DB_ERROR_STR)
-
-
+    async with db.client() as client:
+        await client.transaction(transaction_logic, *[str(item_id) for item_id, _ in event.items])
+    await message.ack()
 
 @app.post('/item/create/<price>')
 async def create_item(price: int):

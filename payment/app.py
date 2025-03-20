@@ -98,34 +98,20 @@ async def on_insufficient_stock(message: IncomingMessage):
     user_id = event.user_id
     total_cost = event.total_cost
 
-    async with db.pipeline() as pipe:
-        while True:
-            try:
-                await pipe.watch(user_id)
+    async def transaction_logic(pipe):
+        user_credit = await pipe.get(user_id)
+        user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
 
-                user_credit = await pipe.get(user_id)
-                user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
+        new_credit = user_credit + total_cost
 
-                if user_credit is not None:
-                    new_credit = user_credit + total_cost
+        pipe.multi()
+        await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
 
-                    pipe.multi()
+        order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
+        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
-                    # update the credit
-                    await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
-
-                    await pipe.execute()
-
-                order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
-
-                # send order cancelled event
-                await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-
-                break
-            except redis.WatchError:
-                continue
-            finally:
-                await pipe.unwatch()
+    async with db.client() as client:
+        await client.transaction(transaction_logic, user_id)
 
     await message.ack()
 
