@@ -1,36 +1,40 @@
+import asyncio
 import logging
 import os
 import atexit
 import random
 import uuid
-from collections import defaultdict
 
-import redis
+import redis.asyncio as redis
 import requests
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from quart import Quart, jsonify, abort, Response
 
+from infrastructure import RabbitClient, IncomingMessage, EventWaiter
+from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
-app = Flask("order-service")
+app = Quart("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
+rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 
-def close_db_connection():
-    db.close()
+service_id = uuid.uuid4()
+event_waiter = EventWaiter()
 
+async def close_db_connection():
+    await db.close()
 
 atexit.register(close_db_connection)
-
 
 class OrderValue(Struct):
     paid: bool
@@ -38,11 +42,10 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
-
-def get_order_from_db(order_id: str) -> OrderValue | None:
+async def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(order_id)
+        entry: bytes = await db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -52,20 +55,67 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         abort(400, f"Order: {order_id} not found!")
     return entry
 
+@app.before_serving
+async def startup():
+    await rabbit_client.start()
 
+    asyncio.create_task(rabbit_client.subscribe(f'stock-reserved-{service_id}', on_stock_reserved))
+    asyncio.create_task(rabbit_client.subscribe(f'order-cancelled-{service_id}', on_order_cancelled))
+
+
+async def on_stock_reserved(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=StockReservedEvent)
+
+    async with db.pipeline() as pipe:
+        while True:
+            try:
+                await pipe.watch(event.order_id)
+
+                entry = await pipe.get(event.order_id)
+                entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+                if entry is None:
+                    await message.ack()
+                    await pipe.unwatch()
+                    event_waiter.trigger_event(event.order_id, None) 
+                    return
+
+                entry.paid = True
+
+                pipe.multi()
+                await pipe.set(event.order_id, msgpack.encode(entry))
+
+                await pipe.execute()
+                break
+            except redis.WatchError:
+                continue
+            finally:
+                await pipe.unwatch()
+    
+    event_waiter.trigger_event(event.order_id, entry) # TODO: consider reverting order if trigger_event returns False
+    
+    await message.ack()
+
+
+async def on_order_cancelled(message: IncomingMessage):
+    event = msgpack.decode(message.body, type=OrderCancelledEvent)
+
+    event_waiter.trigger_event(event.order_id, None)
+
+    await message.ack()
+    
 @app.post('/create/<user_id>')
-def create_order(user_id: str):
+async def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
-        db.set(key, value)
+        await db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
     n = int(n)
     n_items = int(n_items)
@@ -85,15 +135,15 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        await db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
 @app.get('/find/<order_id>')
-def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+async def find_order(order_id: str):
+    order_entry: OrderValue = await get_order_from_db(order_id)
     return jsonify(
         {
             "order_id": order_id,
@@ -105,16 +155,7 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
-def send_get_request(url: str):
+async def send_get_request(url: str):
     try:
         response = requests.get(url)
     except requests.exceptions.RequestException:
@@ -124,9 +165,9 @@ def send_get_request(url: str):
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
-def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+async def add_item(order_id: str, item_id: str, quantity: int):
+    order_entry: OrderValue = await get_order_from_db(order_id)
+    item_reply = await send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
         # Request failed because item does not exist
         abort(400, f"Item: {item_id} does not exist!")
@@ -134,46 +175,25 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
-        db.set(order_id, msgpack.encode(order_entry))
+        await db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
-def checkout(order_id: str):
+async def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue = await get_order_from_db(order_id)
+
+    event = OrderPlacedEvent(order_id=order_id, user_id=order_entry.user_id, items=order_entry.items, total_cost=order_entry.total_cost, order_handling_service_id=service_id)
+    await rabbit_client.publish(f'order-placed-{service_id}', event)
+
+    data = await event_waiter.wait_for_event(order_id)
+    if data is None:
+        abort(400, "Checkout failed")
+
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 

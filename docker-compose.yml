@@ -16,12 +16,14 @@ services:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - GATEWAY_URL=http://gateway:80\
+      - RABBIT_URL=amqp://guest:guest@message-bus:5672/
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - message-bus
 
   order-db:
     image: redis:7.2-bookworm
@@ -52,3 +54,12 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  message-bus:
+    image: rabbitmq:3-management-alpine
+    ports:
+        - 5672:5672
+        - 15672:15672
+    volumes:
+        - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
+        - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
