@@ -5,7 +5,7 @@ import atexit
 import random
 import uuid
 
-import redis.asyncio as redis
+import redis
 import requests
 
 from msgspec import msgpack, Struct
@@ -21,7 +21,7 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Quart("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
+db = redis.asyncio.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
@@ -188,7 +188,7 @@ async def checkout(order_id: str):
     order_entry: OrderValue = await get_order_from_db(order_id)
 
     event = OrderPlacedEvent(order_id=order_id, user_id=order_entry.user_id, items=order_entry.items, total_cost=order_entry.total_cost, order_handling_service_id=service_id)
-    await rabbit_client.publish(f'order-placed-{service_id}', event)
+    await rabbit_client.publish('order-placed', event)
 
     data = await event_waiter.wait_for_event(order_id)
     if data is None:

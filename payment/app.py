@@ -4,12 +4,12 @@ import os
 import atexit
 import uuid
 
-import redis.asyncio as redis
+import redis
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-from infrastructure import RabbitClient, IncomingMessage, EventWaiter
+from infrastructure import RabbitClient, IncomingMessage
 from events import OrderPlacedEvent, OrderCancelledEvent, OrderPaidEvent, InsufficientStockEvent
 
 DB_ERROR_STR = "DB error"
@@ -19,9 +19,8 @@ rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 app = Quart("payment-service")
 
 service_id = uuid.uuid4()
-event_waiter = EventWaiter()
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
+db = redis.asyncio.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
@@ -56,8 +55,8 @@ async def get_user_from_db(user_id: str) -> UserValue | None:
 async def startup():
     await rabbit_client.start()
 
-    asyncio.create_task(rabbit_client.subscribe(f'order-placed-{service_id}', on_order_placed))
-    asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock-{service_id}', on_insufficient_stock))
+    asyncio.create_task(rabbit_client.subscribe(f'order-placed', on_order_placed))
+    asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock', on_insufficient_stock))
 
 
 async def on_order_placed(message: IncomingMessage):
@@ -71,22 +70,20 @@ async def on_order_placed(message: IncomingMessage):
                 await pipe.watch(user_id)
 
                 user_credit = await pipe.get(user_id)
-                user_credit = msgpack.decode(user_credit, type=UserValue) if user_credit else None
+                user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
 
-                if user_credit >= total_cost:
+                if user_credit is not None and user_credit >= total_cost:
                     new_credit = user_credit - total_cost
 
                     pipe.multi()
                     await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
 
                     await pipe.execute()
-                    order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost)
-                    await rabbit_client.publish(f'order-paid-{event.order_handling_service_id}', order_paid_event)
-
+                    order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost, items=event.items, order_handling_service_id=event.order_handling_service_id)
+                    await rabbit_client.publish('order-paid', order_paid_event)
                 else:
-                    order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost)
+                    order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
                     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-
                 break
 
             except redis.WatchError:
@@ -107,21 +104,22 @@ async def on_insufficient_stock(message: IncomingMessage):
                 await pipe.watch(user_id)
 
                 user_credit = await pipe.get(user_id)
-                user_credit = int(user_credit) if user_credit else 0
+                user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
 
-                new_credit = user_credit + total_cost
+                if user_credit is not None:
+                    new_credit = user_credit + total_cost
 
-                pipe.multi()
+                    pipe.multi()
 
-                # update the credit
-                await pipe.set(user_id, new_credit)
+                    # update the credit
+                    await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
 
-                await pipe.execute()
+                    await pipe.execute()
 
-                order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id)
+                order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
 
                 # send order cancelled event
-                await rabbit_client.publish('order-cancelled', msgpack.encode(order_cancelled_event))
+                await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
                 break
             except redis.WatchError:

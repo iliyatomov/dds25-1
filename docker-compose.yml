@@ -16,9 +16,9 @@ services:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80\
+      - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -35,9 +35,9 @@ services:
     build: ./stock
     image: stock:latest
     environment:
-      - GATEWAY_URL=http://gateway:80\
+      - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -54,9 +54,9 @@ services:
     build: ./payment
     image: user:latest
     environment:
-      - GATEWAY_URL=http://gateway:80\
+      - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:

@@ -9,15 +9,15 @@ import redis
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-from infrastructure import RabbitClient, IncomingMessage, EventWaiter
-from events import StockReservedEvent, OrderPaidEvent, InsufficientStockEvent
+from infrastructure import RabbitClient, IncomingMessage
+from events import OrderPaidEvent, InsufficientStockEvent, StockReservedEvent
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 app = Quart("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
+db = redis.asyncio.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
@@ -25,12 +25,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 
 rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 
-service_id = uuid.uuid4()
-event_waiter = EventWaiter()
-
 async def close_db_connection():
     await db.close()
-
 
 atexit.register(close_db_connection)
 
@@ -57,7 +53,7 @@ async def get_item_from_db(item_id: str) -> StockValue | None:
 async def startup():
     await rabbit_client.start()
 
-    asyncio.create_task(rabbit_client.subscribe(f'order-paid-*', on_order_paid))
+    asyncio.create_task(rabbit_client.subscribe(f'order-paid', on_order_paid))
 
 
 async def on_order_paid(message: IncomingMessage):
@@ -72,7 +68,9 @@ async def on_order_paid(message: IncomingMessage):
                 insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
                                                       total_cost=event.total_cost,
                                                       order_handling_service_id=event.order_handling_service_id)
-                await rabbit_client.publish(f"insufficient-stock-{event.order_handling_service_id}", insuff_event)
+                
+                await rabbit_client.publish("insufficient-stock", insuff_event)
+                await message.ack()
                 return
 
             new_stock = stock_entry.stock - quantity
@@ -81,7 +79,9 @@ async def on_order_paid(message: IncomingMessage):
                 insuff_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
                                                       total_cost=event.total_cost,
                                                       order_handling_service_id=event.order_handling_service_id)
-                await rabbit_client.publish(f"insufficient-stock-{event.order_handling_service_id}", insuff_event)
+
+                await rabbit_client.publish("insufficient-stock", insuff_event)
+                await message.ack()
                 return
 
             stock_values[item_id] = new_stock
@@ -93,11 +93,12 @@ async def on_order_paid(message: IncomingMessage):
                 pipe.set(item_id, msgpack.encode(stock_entry))
 
             await pipe.execute()
-            succ_event = InsufficientStockEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
+            succ_event = StockReservedEvent(order_id=event.order_id, user_id=event.user_id, items=event.items,
                                                 total_cost=event.total_cost,
                                                 order_handling_service_id=event.order_handling_service_id)
-            await rabbit_client.publish(f"stock-reserved-{event.order_handling_service_id}", succ_event)
 
+            await rabbit_client.publish(f"stock-reserved-{event.order_handling_service_id}", succ_event)
+            await message.ack()
 
         except redis.exceptions.RedisError as e:
             return abort(400, DB_ERROR_STR)
@@ -110,7 +111,7 @@ async def create_item(price: int):
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        db.set(key, value)
+        await db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})

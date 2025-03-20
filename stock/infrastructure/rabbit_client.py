@@ -3,7 +3,6 @@ import asyncio
 import aio_pika
 from aio_pika import IncomingMessage, Message, RobustConnection
 import aio_pika.abc
-import json
 from msgspec import msgpack
 
 from typing import Any, Awaitable, Callable
