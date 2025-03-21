@@ -1,0 +1,5 @@
+Dido: I worked with Konstantin on making the payment service work asynchronously and implemented the logic for insufficient_stock event. Furthermore I fixed the event_waiter.
+Iliya: I modified the stock service to work asynchronously and implemented the successful behavior in the stock service (the stock service receives an event that the payment service has withdrawn funds successfully and then subtracts stock accordingly in the case there is enough stock).
+Petar: I worked on the base code of the stock service and the implementation of the asynchronous unsuccessful code logic behind the catching of events from the payment service and wrote the backbone code for all event classes.
+Konstantin: I worked along with Dido on making the payment service work asynchronously and implemented the logic for order_placed event. Also converted the payment service transactions to lua scripts. Finally, I wrote a script that runs the consistency test many times for easier testing.
+Georgi: I worked on the overall architecture and implemented the order service. I was also working on covnerting of some the redis transactions into lua scripts. 
