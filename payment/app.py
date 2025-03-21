@@ -60,42 +60,28 @@ async def startup():
 
 
 async def on_order_placed(message: IncomingMessage):
-    app.logger.info("Order placed event received")
-    
     event = msgpack.decode(message.body, type=OrderPlacedEvent)
     user_id = event.user_id
     total_cost = event.total_cost
 
-    app.logger.info(f"User {user_id} has placed an order with total cost {total_cost}")
+    async def transaction_logic(pipe):
+        user_credit = await pipe.get(user_id)
+        user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
 
-    async with db.pipeline() as pipe:
-        while True:
-            try:
-                await pipe.watch(user_id)
+        if user_credit is not None and user_credit >= total_cost:
+            new_credit = user_credit - total_cost
 
-                user_credit = await pipe.get(user_id)
-                user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
+            pipe.multi()
+            await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
 
-                if user_credit is not None and user_credit >= total_cost:
-                    new_credit = user_credit - total_cost
+            order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost, items=event.items, order_handling_service_id=event.order_handling_service_id)
+            await rabbit_client.publish('order-paid', order_paid_event)
+        else:
+            order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
+            await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
-                    pipe.multi()
-                    await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
-
-                    await pipe.execute()
-                    order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost, items=event.items, order_handling_service_id=event.order_handling_service_id)
-                    app.logger.info(f"User {user_id} has paid for the order")
-                    await rabbit_client.publish('order-paid', order_paid_event)
-                else:
-                    order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
-                    app.logger.info(f"User {user_id} has insufficient funds for the order")
-                    await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-                break
-
-            except redis.WatchError:
-                continue
-            finally:
-                await pipe.unwatch()
+    async with db.client() as client:
+        await client.transaction(transaction_logic, user_id)
 
     await message.ack()
 
@@ -171,7 +157,6 @@ async def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 async def remove_credit(user_id: str, amount: int):
-    app.logger.info(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
