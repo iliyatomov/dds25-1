@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import atexit
 import random
 import uuid
 
@@ -34,7 +33,6 @@ event_waiter = EventWaiter()
 async def close_db_connection():
     await db.close()
 
-atexit.register(close_db_connection)
 
 class OrderValue(Struct):
     paid: bool
@@ -57,31 +55,54 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
 
 @app.before_serving
 async def startup():
+    global complete_order_script
+    complete_order_script = db.register_script(LUA_COMPLETE_ORDER)
+
     await rabbit_client.start()
 
     asyncio.create_task(rabbit_client.subscribe(f'stock-reserved-{service_id}', on_stock_reserved))
     asyncio.create_task(rabbit_client.subscribe(f'order-cancelled-{service_id}', on_order_cancelled))
 
 
+@app.after_serving
+async def shutdown():
+    await close_db_connection()
+
+
+LUA_COMPLETE_ORDER = """
+local order_id = KEYS[1]
+
+local entry_data = redis.call("GET", order_id)
+
+if not entry_data then
+    return -1
+end
+
+local success, entry = pcall(cmsgpack.unpack, entry_data)
+if not success then
+    return -1
+end
+
+entry.paid = true
+
+redis.call("SET", order_id, cmsgpack.pack(entry))
+
+return 0
+"""
+
+
+complete_order_script = None
+
+
 async def on_stock_reserved(message: IncomingMessage):
     event = msgpack.decode(message.body, type=StockReservedEvent)
 
-    async def transaction_logic(pipe):
-        entry = await pipe.get(event.order_id)
-        entry = msgpack.decode(entry, type=OrderValue) if entry else None
-        if entry is None:
-            event_waiter.trigger_event(event.order_id, None) 
-            return
+    response = await complete_order_script(keys=[event.order_id], args=[])
 
-        entry.paid = True
-
-        pipe.multi()
-        await pipe.set(event.order_id, msgpack.encode(entry))
-
-    async with db.client() as client:
-        await client.transaction(transaction_logic, event.order_id)
-
-    event_waiter.trigger_event(event.order_id, event.order_id) # TODO: consider reverting order if trigger_event returns False
+    if response == 0:
+        event_waiter.trigger_event(event.order_id, event.order_id)
+    else:
+        event_waiter.trigger_event(event.order_id, None) # TODO: consider reverting order if trigger_event returns False
 
     await message.ack()
 
