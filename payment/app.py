@@ -3,7 +3,7 @@ import logging
 import os
 import atexit
 import uuid
-
+import json
 import redis
 
 from msgspec import msgpack, Struct
@@ -59,65 +59,91 @@ async def startup():
     asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock', on_insufficient_stock))
 
 
+LUA_ORDER_PLACED = """
+local user_id = KEYS[1]
+local total_cost = tonumber(ARGV[1])
+local user_data = redis.call("GET", user_id)
+if not user_data then
+    return cjson.encode({err="User not found"})
+end
+
+local user = cmsgpack.unpack(user_data)
+
+if user.credit >= total_cost then
+    user.credit = user.credit - total_cost
+
+    local updated_user_data = cmsgpack.pack(user)
+    redis.call("SET", user_id, updated_user_data)
+    return cjson.encode({status="order_paid"})
+else
+    return cjson.encode({status="insufficient_funds"})
+end
+    """
+
+
 async def on_order_placed(message: IncomingMessage):
-    app.logger.info("Order placed event received")
-    
     event = msgpack.decode(message.body, type=OrderPlacedEvent)
-    user_id = event.user_id
+    user_id = str(event.user_id)  # Ensure it's a string for Redis
     total_cost = event.total_cost
 
-    app.logger.info(f"User {user_id} has placed an order with total cost {total_cost}")
+    try:
+        result = await db.eval(LUA_ORDER_PLACED, 1, user_id, total_cost)
+        response = json.loads(result)
 
-    async with db.pipeline() as pipe:
-        while True:
-            try:
-                await pipe.watch(user_id)
+        if response["status"] == "order_paid":
+            order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
+                                              items=event.items,
+                                              order_handling_service_id=event.order_handling_service_id)
+            await rabbit_client.publish('order-paid', order_paid_event)
+        else:
+            order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
+                                                        order_handling_service_id=event.order_handling_service_id)
+            await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
-                user_credit = await pipe.get(user_id)
-                user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
-
-                if user_credit is not None and user_credit >= total_cost:
-                    new_credit = user_credit - total_cost
-
-                    pipe.multi()
-                    await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
-
-                    await pipe.execute()
-                    order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost, items=event.items, order_handling_service_id=event.order_handling_service_id)
-                    app.logger.info(f"User {user_id} has paid for the order")
-                    await rabbit_client.publish('order-paid', order_paid_event)
-                else:
-                    order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
-                    app.logger.info(f"User {user_id} has insufficient funds for the order")
-                    await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-                break
-
-            except redis.WatchError:
-                continue
-            finally:
-                await pipe.unwatch()
+    except Exception as e:
+        print(f"Error: {e}")
 
     await message.ack()
 
+
+LUA_INSUFFICIENT_STOCK = """
+local user_id = KEYS[1]
+local total_cost = tonumber(ARGV[1])
+local user_data = redis.call("GET", user_id)
+
+local user = cmsgpack.unpack(user_data)
+
+local new_credit = user.credit + total_cost
+user.credit = new_credit
+
+local updated_user_data = cmsgpack.pack(user)
+
+redis.call("SET", user_id, updated_user_data)
+
+return cjson.encode({status="order_cancelled"})
+"""
+
+
 async def on_insufficient_stock(message: IncomingMessage):
     event = msgpack.decode(message.body, type=InsufficientStockEvent)
-    user_id = event.user_id
+    user_id = str(event.user_id)  # Ensure it's a string for Redis
     total_cost = event.total_cost
 
-    async def transaction_logic(pipe):
-        user_credit = await pipe.get(user_id)
-        user_credit = msgpack.decode(user_credit, type=UserValue).credit if user_credit else None
+    try:
+        result = await db.eval(LUA_INSUFFICIENT_STOCK, 1, user_id, total_cost)
+        response = json.loads(result)
 
-        new_credit = user_credit + total_cost
-
-        pipe.multi()
-        await pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
-
-        order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
-        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-
-    async with db.client() as client:
-        await client.transaction(transaction_logic, user_id)
+        if response["status"] == "order_cancelled":
+            order_cancelled_event = OrderCancelledEvent(
+                order_id=event.order_id,
+                user_id=user_id,
+                order_handling_service_id=event.order_handling_service_id
+            )
+            await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+        else:
+            app.logger.warning(f"Unexpected response from Lua script: {response}")
+    except Exception as e:
+        print(f"Error: {e}")
 
     await message.ack()
 
@@ -171,7 +197,6 @@ async def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 async def remove_credit(user_id: str, amount: int):
-    app.logger.info(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
