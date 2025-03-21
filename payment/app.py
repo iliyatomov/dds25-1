@@ -1,9 +1,7 @@
 import asyncio
 import logging
 import os
-import atexit
 import uuid
-import json
 import redis
 
 from msgspec import msgpack, Struct
@@ -30,9 +28,6 @@ async def close_db_connection():
     await db.close()
 
 
-atexit.register(close_db_connection)
-
-
 class UserValue(Struct):
     credit: int
 
@@ -53,10 +48,21 @@ async def get_user_from_db(user_id: str) -> UserValue | None:
 
 @app.before_serving
 async def startup():
+    global charge_order_script
+    charge_order_script = db.register_script(LUA_ORDER_PLACED)
+
+    global revert_payment_script
+    revert_payment_script = db.register_script(LUA_INSUFFICIENT_STOCK)
+
     await rabbit_client.start()
 
     asyncio.create_task(rabbit_client.subscribe(f'order-placed', on_order_placed))
     asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock', on_insufficient_stock))
+
+
+@app.after_serving
+async def shutdown():
+    await close_db_connection()
 
 
 LUA_ORDER_PLACED = """
@@ -64,7 +70,7 @@ local user_id = KEYS[1]
 local total_cost = tonumber(ARGV[1])
 local user_data = redis.call("GET", user_id)
 if not user_data then
-    return cjson.encode({err="User not found"})
+    return -1
 end
 
 local user = cmsgpack.unpack(user_data)
@@ -74,34 +80,33 @@ if user.credit >= total_cost then
 
     local updated_user_data = cmsgpack.pack(user)
     redis.call("SET", user_id, updated_user_data)
-    return cjson.encode({status="order_paid"})
+    return 0
 else
-    return cjson.encode({status="insufficient_funds"})
+    return -2
 end
     """
 
 
+charge_order_script = None
+
+
 async def on_order_placed(message: IncomingMessage):
     event = msgpack.decode(message.body, type=OrderPlacedEvent)
-    user_id = str(event.user_id)  # Ensure it's a string for Redis
+
+    user_id = str(event.user_id)
     total_cost = event.total_cost
 
-    try:
-        result = await db.eval(LUA_ORDER_PLACED, 1, user_id, total_cost)
-        response = json.loads(result)
+    response = await charge_order_script(keys=[user_id], args=[total_cost])
 
-        if response["status"] == "order_paid":
-            order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
+    if response == 0:
+        order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
                                               items=event.items,
                                               order_handling_service_id=event.order_handling_service_id)
-            await rabbit_client.publish('order-paid', order_paid_event)
-        else:
-            order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
+        await rabbit_client.publish('order-paid', order_paid_event)
+    else:
+        order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
                                                         order_handling_service_id=event.order_handling_service_id)
-            await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-
-    except Exception as e:
-        print(f"Error: {e}")
+        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
@@ -120,8 +125,11 @@ local updated_user_data = cmsgpack.pack(user)
 
 redis.call("SET", user_id, updated_user_data)
 
-return cjson.encode({status="order_cancelled"})
+return 0
 """
+
+
+revert_payment_script = None
 
 
 async def on_insufficient_stock(message: IncomingMessage):
@@ -129,21 +137,15 @@ async def on_insufficient_stock(message: IncomingMessage):
     user_id = str(event.user_id)  # Ensure it's a string for Redis
     total_cost = event.total_cost
 
-    try:
-        result = await db.eval(LUA_INSUFFICIENT_STOCK, 1, user_id, total_cost)
-        response = json.loads(result)
+    response = await revert_payment_script(keys=[user_id], args=[total_cost])
 
-        if response["status"] == "order_cancelled":
-            order_cancelled_event = OrderCancelledEvent(
-                order_id=event.order_id,
-                user_id=user_id,
-                order_handling_service_id=event.order_handling_service_id
-            )
-            await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
-        else:
-            app.logger.warning(f"Unexpected response from Lua script: {response}")
-    except Exception as e:
-        print(f"Error: {e}")
+    if response == 0:
+        order_cancelled_event = OrderCancelledEvent(
+            order_id=event.order_id,
+            user_id=user_id,
+            order_handling_service_id=event.order_handling_service_id
+        )
+        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
