@@ -60,9 +60,13 @@ async def startup():
 
 
 async def on_order_placed(message: IncomingMessage):
+    app.logger.info("Order placed event received")
+    
     event = msgpack.decode(message.body, type=OrderPlacedEvent)
     user_id = event.user_id
     total_cost = event.total_cost
+
+    app.logger.info(f"User {user_id} has placed an order with total cost {total_cost}")
 
     async with db.pipeline() as pipe:
         while True:
@@ -80,9 +84,11 @@ async def on_order_placed(message: IncomingMessage):
 
                     await pipe.execute()
                     order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost, items=event.items, order_handling_service_id=event.order_handling_service_id)
+                    app.logger.info(f"User {user_id} has paid for the order")
                     await rabbit_client.publish('order-paid', order_paid_event)
                 else:
                     order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id, order_handling_service_id=event.order_handling_service_id)
+                    app.logger.info(f"User {user_id} has insufficient funds for the order")
                     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
                 break
 
@@ -165,8 +171,8 @@ async def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 async def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
+    app.logger.info(f"Removing {amount} credit from user: {user_id}")
+    user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
