@@ -280,14 +280,29 @@ async def create_user():
 
 @app.post('/batch_init/<n>/<starting_money>')
 async def batch_init_users(n: int, starting_money: int):
-    n = int(n)
-    starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
-                                  for i in range(n)}
-    # try:
-    #    await db.mset(kv_pairs)
-    # except redis.exceptions.RedisError:
-    #     return abort(400, DB_ERROR_STR)
+    # n = int(n)
+    # starting_money = int(starting_money)
+    # kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
+    #                               for i in range(n)}
+    # # try:
+    # #    await db.mset(kv_pairs)
+    # # except redis.exceptions.RedisError:
+    # #     return abort(400, DB_ERROR_STR)
+    try:
+        # Generate list of dictionaries with user data
+        user_data = [
+            {"user_id": str(i), "credit": starting_money}
+            for i in range(n)
+        ]
+
+        # Perform batch insert
+        stmt = users_table.insert(users_table).values(user_data)
+        await database.execute(stmt)
+        await database.commit()
+    except Exception as e:
+        await database.rollback()
+        return abort(400, DB_ERROR_STR)
+
     return jsonify({"msg": "Batch init for users successful"})
 
 
