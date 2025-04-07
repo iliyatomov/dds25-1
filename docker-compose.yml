@@ -73,6 +73,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db:5433/payment_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
@@ -83,8 +84,24 @@ services:
         condition: service_started
 
   payment-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    image: postgres:17.4
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=payment_db
+    ports:
+      - 5433:5433
+    volumes:
+      - order-db:/var/lib/postgresql/data
+    command: >
+      postgres -c wal_level=logical
+               -c max_replication_slots=10
+               -c max_wal_senders=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 1s
+      retries: 10
 
   message-bus:
     image: rabbitmq:3-management-alpine
@@ -106,6 +123,18 @@ services:
       - ./debezium-config/order.application.properties:/debezium/config/application.properties:readonly
     ports:
       - "8083:8083"
+    depends_on:
+      message-bus:
+        condition: service_healthy
+      order-db:
+        condition: service_started
+
+  payment-debezium:
+    image: quay.io/debezium/server:3.1.0.Final
+    volumes:
+      - ./debezium-config/order.application.properties:/debezium/config/application.properties:readonly
+    ports:
+      - "8084:8084"
     depends_on:
       message-bus:
         condition: service_healthy
