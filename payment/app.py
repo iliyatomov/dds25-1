@@ -4,7 +4,9 @@ import logging
 import os
 import uuid
 import msgspec
-import redis
+from databases import Database
+import msgspec
+import sqlalchemy
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
@@ -12,22 +14,37 @@ from quart import Quart, jsonify, abort, Response
 from infrastructure import RabbitClient, IncomingMessage
 from events import OrderPlacedEvent, OrderCancelledEvent, OrderPaidEvent, InsufficientStockEvent
 
-DB_ERROR_STR = "DB error"
+logging.basicConfig(level=logging.INFO)
 
+DB_ERROR_STR = "DB error"
+DATABASE_URL = os.environ['DATABASE_URL']
 
 rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
 app = Quart("payment-service")
 
 service_id = uuid.uuid4()
 
-db = redis.asyncio.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+database = Database(DATABASE_URL)
 
+metadata = sqlalchemy.MetaData()
+dialect = sqlalchemy.dialects.postgresql.dialect()
 
-async def close_db_connection():
-    await db.close()
+users_table = sqlalchemy.Table(
+    "users",
+    metadata,
+    sqlalchemy.Column("user_id", sqlalchemy.String, primary_key=True),
+    sqlalchemy.Column("credit", sqlalchemy.Integer, nullable=False),
+)
+
+outbox_table = sqlalchemy.Table(
+    "outbox",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False),
+    sqlalchemy.Column("aggregatetype", sqlalchemy.String(255), nullable=False),
+    sqlalchemy.Column("aggregateid", sqlalchemy.String(255), nullable=False, index=True),
+    sqlalchemy.Column("type", sqlalchemy.String(255), nullable=False),
+    sqlalchemy.Column("payload", sqlalchemy.JSON),
+)
 
 
 class UserValue(Struct):
@@ -35,26 +52,27 @@ class UserValue(Struct):
 
 
 async def get_user_from_db(user_id: str) -> UserValue | None:
-    try:
-        # get serialized data
-        entry: bytes = await db.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
-    if entry is None:
-        # if user does not exist in the database; abort
+    query = sqlalchemy.select(users_table).where(users_table.c.user_id == user_id)
+    rows = await database.fetch_all(query=query)
+    if not rows:
         abort(400, f"User: {user_id} not found!")
-    return entry
+    user_entry = rows[0]
+    user_entry = UserValue(credit=user_entry['credit'])
+    return user_entry
 
 
 @app.before_serving
 async def startup():
-    global charge_order_script
-    charge_order_script = db.register_script(LUA_ORDER_PLACED)
+    await database.connect()
 
-    global revert_payment_script
-    revert_payment_script = db.register_script(LUA_INSUFFICIENT_STOCK)
+    async with database.transaction():
+        for table in metadata.tables.values():
+            schema = sqlalchemy.schema.CreateTable(table, if_not_exists=True)
+            query = str(schema.compile(dialect=dialect))
+            await database.execute(query=query)
+            logging.info(f"Table {table.name} created")
+
+    logging.info("Connected to the database")
 
     await rabbit_client.start()
 
@@ -64,7 +82,7 @@ async def startup():
 
 @app.after_serving
 async def shutdown():
-    await close_db_connection()
+    await database.disconnect()
 
 
 LUA_ORDER_PLACED = """
@@ -98,17 +116,17 @@ async def on_order_placed(message: IncomingMessage):
     user_id = str(event.user_id)
     total_cost = event.total_cost
 
-    response = await charge_order_script(keys=[user_id], args=[total_cost])
-
-    if response == 0:
-        order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
-                                              items=event.items,
-                                              order_handling_service_id=event.order_handling_service_id)
-        await rabbit_client.publish('order-paid', order_paid_event)
-    else:
-        order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
-                                                        order_handling_service_id=event.order_handling_service_id)
-        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+    # response = await charge_order_script(keys=[user_id], args=[total_cost])
+    #
+    # if response == 0:
+    #     order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
+    #                                           items=event.items,
+    #                                           order_handling_service_id=event.order_handling_service_id)
+    #     await rabbit_client.publish('order-paid', order_paid_event)
+    # else:
+    #     order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
+    #                                                     order_handling_service_id=event.order_handling_service_id)
+    #     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
@@ -139,15 +157,15 @@ async def on_insufficient_stock(message: IncomingMessage):
     user_id = str(event.user_id)  # Ensure it's a string for Redis
     total_cost = event.total_cost
 
-    response = await revert_payment_script(keys=[user_id], args=[total_cost])
-
-    if response == 0:
-        order_cancelled_event = OrderCancelledEvent(
-            order_id=event.order_id,
-            user_id=user_id,
-            order_handling_service_id=event.order_handling_service_id
-        )
-        await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+    # response = await revert_payment_script(keys=[user_id], args=[total_cost])
+    #
+    # if response == 0:
+    #     order_cancelled_event = OrderCancelledEvent(
+    #         order_id=event.order_id,
+    #         user_id=user_id,
+    #         order_handling_service_id=event.order_handling_service_id
+    #     )
+    #     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
@@ -156,10 +174,10 @@ async def on_insufficient_stock(message: IncomingMessage):
 async def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
-    try:
-        await db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    # try:
+    #     await db.set(key, value)
+    # except redis.exceptions.RedisError:
+    #     return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
 
@@ -169,10 +187,10 @@ async def batch_init_users(n: int, starting_money: int):
     starting_money = int(starting_money)
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
-    try:
-       await db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    # try:
+    #    await db.mset(kv_pairs)
+    # except redis.exceptions.RedisError:
+    #     return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
 
 
@@ -192,10 +210,10 @@ async def add_credit(user_id: str, amount: int):
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit += int(amount)
-    try:
-        await db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    # try:
+    #     await db.set(user_id, msgpack.encode(user_entry))
+    # except redis.exceptions.RedisError:
+    #     return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
@@ -206,10 +224,10 @@ async def remove_credit(user_id: str, amount: int):
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
         abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        await db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    # try:
+    #     await db.set(user_id, msgpack.encode(user_entry))
+    # except redis.exceptions.RedisError:
+    #     return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
