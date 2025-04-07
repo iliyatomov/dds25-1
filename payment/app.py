@@ -123,8 +123,7 @@ async def on_order_placed(message: IncomingMessage):
 
     if not row:
         response = -1
-
-    if total_cost > row['credit']:
+    elif total_cost > row['credit']:
         response = -2
     
     if response == 0:
@@ -184,6 +183,7 @@ async def on_order_placed(message: IncomingMessage):
                 "payload": msgspec.to_builtins(order_cancelled_event)
             }
             insert_event = outbox_table.insert().values(**event_data)
+            await database.execute(insert_event)
             # await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
@@ -254,6 +254,7 @@ async def on_insufficient_stock(message: IncomingMessage):
                 "payload": msgspec.to_builtins(order_cancelled_event)
             }
             insert_event = outbox_table.insert().values(**event_data)
+            await database.execute(insert_event)
             # await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
@@ -263,10 +264,17 @@ async def on_insufficient_stock(message: IncomingMessage):
 async def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
-    # try:
-    #     await db.set(key, value)
-    # except redis.exceptions.RedisError:
-    #     return abort(400, DB_ERROR_STR)
+
+    user_data = msgpack.decode(value)
+
+    stmt = users_table.insert().values(
+        user_id=key,
+        credit=user_data['credit']
+    )
+    try:
+        await database.execute(stmt)
+    except Exception as e:
+        return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
 
