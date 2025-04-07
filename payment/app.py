@@ -346,6 +346,16 @@ async def remove_credit(user_id: str, amount: int):
     #     await db.set(user_id, msgpack.encode(user_entry))
     # except redis.exceptions.RedisError:
     #     return abort(400, DB_ERROR_STR)
+    try:
+        query = (
+            users_table.update()
+            .where(users_table.c.user_id == user_id)
+            .values(credit=user_entry.credit)
+        )
+        await database.execute(query)
+    except Exception as e:
+        return abort(400, DB_ERROR_STR)
+
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
