@@ -112,6 +112,10 @@ charge_order_script = None
 
 
 async def on_order_placed(message: IncomingMessage):
+
+    app.logger.info(f"Received message: {message.body.decode('utf-8')}")
+
+
     event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=OrderPlacedEvent)
 
     user_id = str(event.user_id)
@@ -119,12 +123,19 @@ async def on_order_placed(message: IncomingMessage):
 
     query = users_table.select().where(users_table.c.user_id == user_id)
     row = await database.fetch_one(query)
+
+    app.logger.info(f"Row: {row}")
+    app.logger.info(f"User ID: {row['user_id']}")
+    app.logger.info(f"Money: {row['credit']}")
+
     response = 0
 
     if not row:
         response = -1
     elif total_cost > row['credit']:
         response = -2
+
+    app.logger.info(f"Response: {response}")
     
     if response == 0:
         new_credit = row['credit'] - total_cost
@@ -149,16 +160,17 @@ async def on_order_placed(message: IncomingMessage):
 
         result = await database.fetch_one(stmt)
 
-        if not result:
-            event_data = {
-                "id": uuid.uuid4(),
-                "aggregatetype": "payment",
-                "aggregateid": event.order_id,
-                "type": "order-paid",
-                "payload": msgspec.to_builtins(order_paid_event)
-            }
-            insert_event = outbox_table.insert().values(**event_data)
-            await database.execute(insert_event)
+        # if not result:
+        event_data = {
+            "id": uuid.uuid4(),
+            "aggregatetype": "payment",
+            "aggregateid": event.order_id,
+            "type": "order-paid",
+            "payload": msgspec.to_builtins(order_paid_event)
+        }
+        insert_event = outbox_table.insert().values(**event_data)
+        await database.execute(insert_event)
+        app.logger.info(f"Order paid event: {order_paid_event}")
 
         # await rabbit_client.publish('order-paid', order_paid_event)
     else:
@@ -174,16 +186,18 @@ async def on_order_placed(message: IncomingMessage):
 
         result = await database.fetch_one(stmt)
 
-        if not result:
-            event_data = {
-                "id": uuid.uuid4(),
-                "aggregatetype": "payment",
-                "aggregateid": event.order_id,
-                "type": "order-cancelled",
-                "payload": msgspec.to_builtins(order_cancelled_event)
-            }
-            insert_event = outbox_table.insert().values(**event_data)
-            await database.execute(insert_event)
+        # if not result:
+        event_data = {
+            "id": uuid.uuid4(),
+            "aggregatetype": "payment",
+            "aggregateid": event.order_id,
+            "type": "order-cancelled",
+            "payload": msgspec.to_builtins(order_cancelled_event)
+        }
+        insert_event = outbox_table.insert().values(**event_data)
+        await database.execute(insert_event)
+
+        app.logger.info(f"Order cancelled event: {order_cancelled_event}")
             # await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
@@ -265,6 +279,8 @@ async def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
 
+    app.logger.info(f"Creating user with ID: {key}")
+
     user_data = msgpack.decode(value)
 
     stmt = users_table.insert().values(
@@ -290,6 +306,7 @@ async def batch_init_users(n: int, starting_money: int):
     # #     return abort(400, DB_ERROR_STR)
     try:
         # Generate list of dictionaries with user data
+        app.logger.info(f"Batch init for {n} users with {starting_money} starting money")
         user_data = [
             {"user_id": str(i), "credit": starting_money}
             for i in range(n)
@@ -322,13 +339,22 @@ async def add_credit(user_id: str, amount: int):
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit += int(amount)
+    app.logger.info("hello world")
     try:
+
+        query = users_table.select().where(users_table.c.user_id == user_id)
+        row = await database.fetch_one(query)
+        app.logger.info(f"Before Row: {row["credit"]}")
         query = (
             users_table.update()
             .where(users_table.c.user_id == user_id)
             .values(credit=user_entry.credit)
         )
         await database.execute(query)
+
+        query = users_table.select().where(users_table.c.user_id == user_id)
+        row = await database.fetch_one(query)
+        app.logger.info(f"After Row: {row["credit"]}")
     except Exception as e:
         return abort(400, DB_ERROR_STR)
     
@@ -337,6 +363,7 @@ async def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 async def remove_credit(user_id: str, amount: int):
+    app.logger.info(f"Paying {amount} for user {user_id}")
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
