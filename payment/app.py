@@ -212,18 +212,49 @@ revert_payment_script = None
 
 async def on_insufficient_stock(message: IncomingMessage):
     event = msgpack.decode(message.body, type=InsufficientStockEvent)
-    user_id = str(event.user_id)  # Ensure it's a string for Redis
+    user_id = str(event.user_id)
     total_cost = event.total_cost
 
-    # response = await revert_payment_script(keys=[user_id], args=[total_cost])
-    #
-    # if response == 0:
-    #     order_cancelled_event = OrderCancelledEvent(
-    #         order_id=event.order_id,
-    #         user_id=user_id,
-    #         order_handling_service_id=event.order_handling_service_id
-    #     )
-    #     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+    query = users_table.select().where(users_table.c.user_id == user_id)
+    row = await database.fetch_one(query)
+    response = 0
+    if not row:
+        response = -1
+    if response == 0:
+        new_credit = row['credit'] + total_cost
+
+        query = (
+            users_table.update()
+            .where(users_table.c.user_id == user_id)
+            .values(credit=new_credit)
+        )
+        await database.execute(query)
+
+        order_cancelled_event = OrderCancelledEvent(
+                     order_id=event.order_id,
+                     user_id=user_id,
+                     order_handling_service_id=event.order_handling_service_id
+                 )
+
+        stmt = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id,
+                outbox_table.c.type == "order-cancelled"
+            )
+        )
+
+        result = await database.fetch_one(stmt)
+
+        if not result:
+            event_data = {
+                "id": uuid.uuid4(),
+                "aggregatetype": "payment",
+                "aggregateid": event.order_id,
+                "type": "order-cancelled",
+                "payload": msgspec.to_builtins(order_cancelled_event)
+            }
+            insert_event = outbox_table.insert().values(**event_data)
+            # await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
