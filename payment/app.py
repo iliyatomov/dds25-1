@@ -7,6 +7,7 @@ import msgspec
 from databases import Database
 import msgspec
 import sqlalchemy
+from sqlalchemy import select, and_
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
@@ -116,17 +117,74 @@ async def on_order_placed(message: IncomingMessage):
     user_id = str(event.user_id)
     total_cost = event.total_cost
 
-    # response = await charge_order_script(keys=[user_id], args=[total_cost])
-    #
-    # if response == 0:
-    #     order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
-    #                                           items=event.items,
-    #                                           order_handling_service_id=event.order_handling_service_id)
-    #     await rabbit_client.publish('order-paid', order_paid_event)
-    # else:
-    #     order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
-    #                                                     order_handling_service_id=event.order_handling_service_id)
-    #     await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
+    query = users_table.select().where(users_table.c.user_id == user_id)
+    row = await database.fetch_one(query)
+    response = 0
+
+    if not row:
+        response = -1
+
+    if total_cost > row['credit']:
+        response = -2
+    
+    if response == 0:
+        new_credit = row['credit'] - total_cost
+
+        query = (
+            users_table.update()
+            .where(users_table.c.user_id == user_id)
+            .values(credit=new_credit)
+        )
+        await database.execute(query)
+
+        order_paid_event = OrderPaidEvent(order_id=event.order_id, user_id=user_id, total_cost=total_cost,
+                                              items=event.items,
+                                              order_handling_service_id=event.order_handling_service_id)
+        
+        stmt = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id,
+                outbox_table.c.type == "order-paid"
+            )
+        )
+
+        result = await database.fetch_one(stmt)
+
+        if not result:
+            event_data = {
+                "id": uuid.uuid4(),
+                "aggregatetype": "payment",
+                "aggregateid": event.order_id,
+                "type": "order-paid",
+                "payload": msgspec.to_builtins(order_paid_event)
+            }
+            insert_event = outbox_table.insert().values(**event_data)
+            await database.execute(insert_event)
+
+        # await rabbit_client.publish('order-paid', order_paid_event)
+    else:
+        order_cancelled_event = OrderCancelledEvent(order_id=event.order_id, user_id=user_id,
+                                                        order_handling_service_id=event.order_handling_service_id)
+        
+        stmt = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id,
+                outbox_table.c.type == "order-cancelled"
+            )
+        )
+
+        result = await database.fetch_one(stmt)
+
+        if not result:
+            event_data = {
+                "id": uuid.uuid4(),
+                "aggregatetype": "payment",
+                "aggregateid": event.order_id,
+                "type": "order-cancelled",
+                "payload": msgspec.to_builtins(order_cancelled_event)
+            }
+            insert_event = outbox_table.insert().values(**event_data)
+            # await rabbit_client.publish(f'order-cancelled-{event.order_handling_service_id}', order_cancelled_event)
 
     await message.ack()
 
