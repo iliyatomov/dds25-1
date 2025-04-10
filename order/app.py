@@ -256,6 +256,7 @@ async def checkout(order_id: str):
         }
         insert_event = outbox_table.insert().values(**event_data)
         await database.execute(insert_event)
+        app.logger.info(f"Order placed event: {event}")
 
     app.logger.info(f"Order entry: {order_entry}")
    
