@@ -23,7 +23,11 @@ class RabbitClient:
         await self.channel.set_qos(1)
 
     async def subscribe(self, queue_name: str, message_handler: Callable[[IncomingMessage], Awaitable[Any]]):
-        queue = await self.channel.declare_queue(queue_name) # TODO: durable=True 
+        queue = await self.channel.declare_queue(queue_name, durable=True)
+
+        exchange = await self.channel.get_exchange('amq.topic')
+        await queue.bind(exchange, routing_key=queue_name)
+        
         await queue.consume(message_handler)
 
     async def publish(self, routing_key: str, message: dict):

@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import uuid
+import msgspec
 import redis
 
 from msgspec import msgpack, Struct
@@ -56,8 +58,8 @@ async def startup():
 
     await rabbit_client.start()
 
-    asyncio.create_task(rabbit_client.subscribe(f'order-placed', on_order_placed))
-    asyncio.create_task(rabbit_client.subscribe(f'insufficient-stock', on_insufficient_stock))
+    asyncio.create_task(rabbit_client.subscribe('order-placed', on_order_placed))
+    asyncio.create_task(rabbit_client.subscribe('insufficient-stock', on_insufficient_stock))
 
 
 @app.after_serving
@@ -91,7 +93,7 @@ charge_order_script = None
 
 
 async def on_order_placed(message: IncomingMessage):
-    event = msgpack.decode(message.body, type=OrderPlacedEvent)
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=OrderPlacedEvent)
 
     user_id = str(event.user_id)
     total_cost = event.total_cost

@@ -39,6 +39,10 @@ for i = 4, #ARGV, 2 do
     table.insert(quantities, tonumber(ARGV[i+1]))
 end
 
+if #item_ids == 0 then
+    return 0
+end
+
 local stock_data = redis.call("MGET", unpack(item_ids))
 
 if not stock_data then
