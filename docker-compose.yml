@@ -30,6 +30,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.orders.rule=PathPrefix(`/orders`)"
       - "traefik.http.services.orders.loadbalancer.server.port=5000"
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -66,6 +67,7 @@ services:
       postgres -c wal_level=logical
                -c max_replication_slots=10
                -c max_wal_senders=10
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -84,6 +86,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.stock.rule=PathPrefix(`/stock`)"
       - "traefik.http.services.stock.loadbalancer.server.port=5000"
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -102,6 +105,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.stock.rule=PathPrefix(`/stock`)"
       - "traefik.http.services.stock.loadbalancer.server.port=5000"
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -120,6 +124,7 @@ services:
       postgres -c wal_level=logical
                -c max_replication_slots=10
                -c max_wal_senders=10
+    restart: unless-stopped
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -138,6 +143,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.payment.rule=PathPrefix(`/payment`)"
       - "traefik.http.services.payment.loadbalancer.server.port=5000"
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -156,6 +162,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.payment.rule=PathPrefix(`/payment`)"
       - "traefik.http.services.payment.loadbalancer.server.port=5000"
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -174,6 +181,7 @@ services:
       postgres -c wal_level=logical
                -c max_replication_slots=10
                -c max_wal_senders=10
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -188,6 +196,7 @@ services:
     volumes:
         - message-bus:/var/lib/rabbitmq/
         - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "rabbitmqctl", "status"]
       interval: 10s
@@ -198,6 +207,7 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/order.application.properties:/debezium/config/application.properties:readonly
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -208,6 +218,7 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/stock.application.properties:/debezium/config/application.properties:readonly
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
@@ -218,6 +229,7 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/payment.application.properties:/debezium/config/application.properties:readonly
+    restart: unless-stopped
     depends_on:
       message-bus:
         condition: service_healthy
