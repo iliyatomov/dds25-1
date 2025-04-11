@@ -72,6 +72,12 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
+async def create_sequence(database, sequence_name):
+    try:
+        query = f"CREATE SEQUENCE IF NOT EXISTS {sequence_name}"
+        await database.execute(query=query)
+    except Exception as e:
+        print(f"Sequence {sequence_name} already exists: {e}")
 async def get_order_from_db(order_id: str) -> OrderValue | None:
     query = select(
         orders_table.c.id,
@@ -102,6 +108,7 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
 @app.before_serving
 async def startup():
     await database.connect();
+    await create_sequence(database, "items_id_seq")
     
     for table in metadata.tables.values():
         schema = sqlalchemy.schema.CreateTable(table, if_not_exists=True)

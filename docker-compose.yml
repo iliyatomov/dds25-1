@@ -24,7 +24,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db:5432/order_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db-primary:5432/order_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -33,7 +33,7 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      order-db:
+      order-db-primary:
         condition: service_started
 
   order-service-2:
@@ -42,7 +42,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db:5432/order_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db-primary:5432/order_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -51,34 +51,53 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      order-db:
+      order-db-primary:
         condition: service_started
 
-  order-db:
-    image: postgres:17.4
+  order-db-primary:
+    image: bitnami/postgresql-repmgr:17
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=order_db
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=order_db
+      - POSTGRESQL_WAL_LEVEL=logical
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=1
+      - REPMGR_PRIMARY_HOST=order-db-primary
+      - REPMGR_PARTNER_NODES=order-db-primary-1,order-db-replica-2
+      - REPMGR_NODE_NAME=order-db-primary-1
+      - REPMGR_NODE_NETWORK_NAME=order-db-primary
     volumes:
-      - order-db:/var/lib/postgresql/data
-    command: >
-      postgres -c wal_level=logical
-               -c max_replication_slots=10
-               -c max_wal_senders=10
+      - order-db-primary:/bitnami/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD", "/opt/bitnami/scripts/postgresql-repmgr/healthcheck.sh" ]
       interval: 10s
-      timeout: 1s
-      retries: 10
+      timeout: 5s
+      retries: 5
 
+  order-db-replica:
+    image: bitnami/postgresql-repmgr:17
+    environment:
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=order_db
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=2
+      - REPMGR_PRIMARY_HOST=order-db-primary
+      - REPMGR_PARTNER_NODES=order-db-primary-1,order-db-replica-2
+      - REPMGR_NODE_NAME=order-db-replica-2
+      - REPMGR_NODE_NETWORK_NAME=order-db-replica
+    volumes:
+      - order-db-replica:/bitnami/postgresql
+    depends_on:
+      - order-db-primary
   stock-service:
     build: ./stock
     image: stock:latest
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db:5432/stock_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db-primary:5432/stock_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -87,7 +106,7 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      stock-db:
+      stock-db-primary:
         condition: service_started
   
   stock-service-2:
@@ -96,7 +115,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db:5432/stock_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db-primary:5432/stock_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -105,26 +124,46 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      stock-db:
+      stock-db-primary:
         condition: service_started
 
-  stock-db:
-    image: postgres:17.4
+  stock-db-primary:
+    image: bitnami/postgresql-repmgr:17
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=stock_db
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=stock_db
+      - POSTGRESQL_WAL_LEVEL=logical
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=3
+      - REPMGR_PRIMARY_HOST=stock-db-primary
+      - REPMGR_PARTNER_NODES=stock-db-primary-3,stock-db-replica-4
+      - REPMGR_NODE_NAME=stock-db-primary-3
+      - REPMGR_NODE_NETWORK_NAME=stock-db-primary
     volumes:
-      - stock-db:/var/lib/postgresql/data
-    command: >
-      postgres -c wal_level=logical
-               -c max_replication_slots=10
-               -c max_wal_senders=10
+      - stock-db-primary:/bitnami/postgresql
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD", "/opt/bitnami/scripts/postgresql-repmgr/healthcheck.sh"]
       interval: 10s
-      timeout: 1s
-      retries: 10
+      timeout: 5s
+      retries: 5
+
+  stock-db-replica:
+    image: bitnami/postgresql-repmgr:17
+    environment:
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=stock_db
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=4
+      - REPMGR_PRIMARY_HOST=stock-db-primary
+      - REPMGR_PARTNER_NODES=stock-db-primary-3,stock-db-replica-4
+      - REPMGR_NODE_NAME=stock-db-replica-4
+      - REPMGR_NODE_NETWORK_NAME=stock-db-replica
+    volumes:
+      - stock-db-replica:/bitnami/postgresql
+    depends_on:
+      - stock-db-primary
 
   payment-service:
     build: ./payment
@@ -132,7 +171,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db:5432/payment_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db-primary:5432/payment_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -141,8 +180,9 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      payment-db:
+      payment-db-primary:
         condition: service_started
+
 
   payment-service-2:
     build: ./payment
@@ -150,7 +190,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db:5432/payment_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db-primary:5432/payment_db
     command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     labels:
       - "traefik.enable=true"
@@ -159,26 +199,46 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      payment-db:
+      payment-db-primary:
         condition: service_started
 
-  payment-db:
-    image: postgres:17.4
+  payment-db-primary:
+    image: bitnami/postgresql-repmgr:17
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=payment_db
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=payment_db
+      - POSTGRESQL_WAL_LEVEL=logical
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=5
+      - REPMGR_PRIMARY_HOST=payment-db-primary
+      - REPMGR_PARTNER_NODES=payment-db-primary-5,payment-db-replica-6
+      - REPMGR_NODE_NAME=payment-db-primary-5
+      - REPMGR_NODE_NETWORK_NAME=payment-db-primary
     volumes:
-      - payment-db:/var/lib/postgresql/data
-    command: >
-      postgres -c wal_level=logical
-               -c max_replication_slots=10
-               -c max_wal_senders=10
+      - payment-db-primary:/bitnami/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD", "/opt/bitnami/scripts/postgresql-repmgr/healthcheck.sh" ]
       interval: 10s
-      timeout: 1s
-      retries: 10
+      timeout: 5s
+      retries: 5
+
+  payment-db-replica:
+    image: bitnami/postgresql-repmgr:17
+    environment:
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=postgres
+      - POSTGRESQL_DATABASE=payment_db
+      - REPMGR_PASSWORD=repmgr
+      - REPMGR_NODE_ID=6
+      - REPMGR_PRIMARY_HOST=payment-db-primary
+      - REPMGR_PARTNER_NODES=payment-db-primary-5,payment-db-replica-6
+      - REPMGR_NODE_NAME=payment-db-replica-6
+      - REPMGR_NODE_NETWORK_NAME=payment-db-replica
+    volumes:
+      - payment-db-replica:/bitnami/postgresql
+    depends_on:
+      - payment-db-primary
 
   message-bus:
     image: rabbitmq:3-management-alpine
@@ -201,7 +261,7 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      order-db:
+      order-db-primary:
         condition: service_started
 
   stock-debezium:
@@ -211,7 +271,7 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      stock-db:
+      stock-db-primary:
         condition: service_started
 
   payment-debezium:
@@ -221,15 +281,21 @@ services:
     depends_on:
       message-bus:
         condition: service_healthy
-      payment-db:
+      payment-db-primary:
         condition: service_started
 
 volumes:
-  order-db:
+  order-db-primary:
     external: false
-  stock-db:
+  order-db-replica:
     external: false
-  payment-db:
+  stock-db-primary:
+    external: false
+  stock-db-replica:
+    external: false
+  payment-db-primary:
+    external: false
+  payment-db-replica:
     external: false
   message-bus:
     external: false
