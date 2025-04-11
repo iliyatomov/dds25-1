@@ -212,7 +212,8 @@ async def on_order_cancelled_response(message: IncomingMessage):
 
     await message.ack()
 
-@app.post('/create/<user_id>')
+
+@app.post('/orders/create/<user_id>')
 async def create_order(user_id: str):
     key = str(uuid.uuid4())
     query = orders_table.insert().values(id=key, user_id=user_id, paid=False, total_cost=0, status="none")
@@ -220,7 +221,7 @@ async def create_order(user_id: str):
     return jsonify({'order_id': key})
 
 
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+@app.post('/orders/batch_init/<n>/<n_items>/<n_users>/<item_price>')
 async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
@@ -252,7 +253,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     return jsonify({"msg": "Batch init for orders successful"})
 
 
-@app.get('/find/<order_id>')
+@app.get('/orders/find/<order_id>')
 async def find_order(order_id: str):
     order_entry: OrderValue = await get_order_from_db(order_id)
     return jsonify(
@@ -275,7 +276,7 @@ async def send_get_request(url: str):
         return response
 
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@app.post('/orders/addItem/<order_id>/<item_id>/<quantity>')
 async def add_item(order_id: str, item_id: str, quantity: int):
     item_reply = await send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
@@ -283,10 +284,10 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     item_json: dict = item_reply.json()
 
     async with database.transaction():
-        query = orders_table.select().where(orders_table.c.id == order_id)
+        query = orders_table.select().where(orders_table.c.id == order_id).with_for_update()
         order_entry = await database.fetch_one(query=query)
 
-        if not order_entry:
+        if order_entry is None:
             abort(400, f"Order {order_id} does not exist!")
 
         item_price = int(item_json["price"])
@@ -301,7 +302,7 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
-@app.post('/checkout/<order_id>')
+@app.post('/orders/checkout/<order_id>')
 async def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
 

@@ -179,7 +179,7 @@ async def on_order_paid(message: IncomingMessage):
     await message.ack()
 
 
-@app.post('/item/create/<price>')
+@app.post('/stock/item/create/<price>')
 async def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
@@ -202,7 +202,7 @@ async def create_item(price: int):
     return jsonify({'item_id': key})
 
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
+@app.post('/stock/batch_init/<n>/<starting_stock>/<item_price>')
 async def batch_init_users(n: int, starting_stock: int, item_price: int):
     try:
         item_data = [{"item_id": str(i), "stock": starting_stock, "price": item_price} for i in range(n)]
@@ -217,7 +217,7 @@ async def batch_init_users(n: int, starting_stock: int, item_price: int):
     return jsonify({"msg": "Batch init for stock successful"})
 
 
-@app.get('/find/<item_id>')
+@app.get('/stock/find/<item_id>')
 async def find_item(item_id: str):
     item_entry: StockValue = await get_item_from_db(item_id)
     return jsonify(
@@ -228,7 +228,7 @@ async def find_item(item_id: str):
     )
 
 
-@app.post('/add/<item_id>/<amount>')
+@app.post('/stock/add/<item_id>/<amount>')
 async def add_stock(item_id: str, amount: int):
     item_entry: StockValue = await get_item_from_db(item_id)
     # update stock, serialize and update database
@@ -248,7 +248,7 @@ async def add_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
-@app.post('/subtract/<item_id>/<amount>')
+@app.post('/stock/subtract/<item_id>/<amount>')
 async def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = await get_item_from_db(item_id)
     # update stock, serialize and update database

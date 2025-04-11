@@ -197,7 +197,7 @@ async def on_insufficient_stock(message: IncomingMessage):
     await message.ack()
 
 
-@app.post('/create_user')
+@app.post('/payment/create_user')
 async def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
@@ -215,7 +215,7 @@ async def create_user():
     return jsonify({'user_id': key})
 
 
-@app.post('/batch_init/<n>/<starting_money>')
+@app.post('/payment/batch_init/<n>/<starting_money>')
 async def batch_init_users(n: int, starting_money: int):
     try:
         # Generate list of dictionaries with user data
@@ -236,7 +236,7 @@ async def batch_init_users(n: int, starting_money: int):
     return jsonify({"msg": "Batch init for users successful"})
 
 
-@app.get('/find_user/<user_id>')
+@app.get('/payment/find_user/<user_id>')
 async def find_user(user_id: str):
     user_entry: UserValue = await get_user_from_db(user_id)
     return jsonify(
@@ -247,7 +247,7 @@ async def find_user(user_id: str):
     )
 
 
-@app.post('/add_funds/<user_id>/<amount>')
+@app.post('/payment/add_funds/<user_id>/<amount>')
 async def add_credit(user_id: str, amount: int):
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
@@ -269,7 +269,7 @@ async def add_credit(user_id: str, amount: int):
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
-@app.post('/pay/<user_id>/<amount>')
+@app.post('/payment/pay/<user_id>/<amount>')
 async def remove_credit(user_id: str, amount: int):
     user_entry: UserValue = await get_user_from_db(user_id)
     # update credit, serialize and update database
