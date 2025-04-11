@@ -6,6 +6,7 @@ import asyncio
 from databases import Database
 import msgspec
 import sqlalchemy
+import json
 
 from sqlalchemy import select, and_
 
@@ -21,19 +22,9 @@ DATABASE_URL = os.environ['DATABASE_URL']
 
 logging.basicConfig(level=logging.INFO)
 
-
 app = Quart("stock-service")
 
-# db = redis.asyncio.Redis(host=os.environ['REDIS_HOST'],
-#                               port=int(os.environ['REDIS_PORT']),
-#                               password=os.environ['REDIS_PASSWORD'],
-#                               db=int(os.environ['REDIS_DB']))
-
-
 rabbit_client = RabbitClient(os.environ['RABBIT_URL'])
-
-# async def close_db_connection():
-#     await db.close()
 
 database = Database(DATABASE_URL)
 
@@ -56,61 +47,10 @@ outbox_table = sqlalchemy.Table(
     sqlalchemy.Column("aggregatetype", sqlalchemy.String(255), nullable=False),
     sqlalchemy.Column("aggregateid", sqlalchemy.String(255), nullable=False, index=True),
     sqlalchemy.Column("type", sqlalchemy.String(255), nullable=False),
-    sqlalchemy.Column("payload", sqlalchemy.JSON)
+    sqlalchemy.Column("payload", sqlalchemy.JSON),
+    sqlalchemy.UniqueConstraint("aggregateid", "type", name="uq_outbox_aggregateid_type")
 )
 
-
-LUA_ORDER_PAID = """
-local order_id = ARGV[1]
-local user_id = ARGV[2]
-local total_cost = tonumber(ARGV[3])
-
-local item_ids = {}
-local quantities = {}
-
-for i = 4, #ARGV, 2 do
-    table.insert(item_ids, ARGV[i])
-    table.insert(quantities, tonumber(ARGV[i+1]))
-end
-
-if #item_ids == 0 then
-    return 0
-end
-
-local stock_data = redis.call("MGET", unpack(item_ids))
-
-if not stock_data then
-    return -1
-end
-
-local updated_stock = {}
-local new_values = {}
-
-for i, data in ipairs(stock_data) do
-    if not data then
-        return -1
-    end
-
-    local success, stock_entry = pcall(cmsgpack.unpack, data)
-    if not success then
-        return -3
-    end
-
-    local new_stock = stock_entry.stock - quantities[i]
-    if new_stock < 0 then
-        return -2
-    end
-
-    table.insert(updated_stock, item_ids[i])
-    table.insert(updated_stock, cmsgpack.pack({stock = new_stock, price = stock_entry.price}))
-end
-
-redis.call("MSET", unpack(updated_stock))
-
-return 0
-"""
-
-reserve_stock_script = None
 
 class StockValue(Struct):
     stock: int
@@ -118,33 +58,17 @@ class StockValue(Struct):
 
 
 async def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
-    # try:
-    #     entry: bytes = await db.get(item_id)
-    # except redis.exceptions.RedisError:
-    #     return abort(400, DB_ERROR_STR)
-    # # deserialize data if it exists else return null
-    # entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
-    # if entry is None:
-    #     # if item does not exist in the database; abort
-    #     abort(400, f"Item: {item_id} not found!")
-    # return entry
-
     query = sqlalchemy.select(items_table).where(items_table.c.item_id == item_id)
-    rows = await database.fetch_all(query=query)
+    item_row = await database.fetch_one(query=query)
 
-    if not rows:
+    if item_row is None:
         abort(400, f"Item: {item_id} not found!")
 
-    item_entry = rows[0]
-    item_entry = StockValue(stock=item_entry['stock'], price=item_entry['price'])
-    return item_entry
+    return StockValue(stock=item_row['stock'], price=item_row['price'])
+
 
 @app.before_serving
 async def startup():
-    # global reserve_stock_script
-    # reserve_stock_script = db.register_script(LUA_ORDER_PAID)
-
     await database.connect()
 
     async with database.transaction():
@@ -163,48 +87,51 @@ async def startup():
 
 @app.after_serving
 async def shutdown():
-    # await close_db_connection()
     await database.disconnect()
 
 async def on_order_paid(message: IncomingMessage):
-    event = msgpack.decode(message.body, type=OrderPaidEvent)
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=OrderPaidEvent)
+
+    order_id = event.order_id
+    user_id = str(event.user_id)
+    total_cost = event.total_cost
+    items = event.items
+
+    item_ids = [item[0] for item in items]
+    quantity_map = {item[0]: item[1] for item in items}
 
     async with database.transaction():
-        order_id = event.order_id
-        user_id = str(event.user_id)
-        total_cost = event.total_cost
-        items = event.items
+        event_query = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id,
+                outbox_table.c.type.in_(["stock-reserved", "insufficient-stock"]),
+            )
+        )
 
-        response = 0
-        item_ids = [item[0] for item in items]
-        quantity_map = {item[0]: item[1] for item in items}
+        sent_event = await database.fetch_one(event_query)
+        if sent_event is not None:
+            app.logger.info(f"on_order_paid already processed for order={event.order_id}")
+        else:
+            query = items_table.select().where(items_table.c.item_id.in_(item_ids)).with_for_update()
+            item_rows = await database.fetch_all(query=query)
 
-        query = items_table.select().where(items_table.c.item_id.in_(item_ids))
-        rows = await database.fetch_all(query=query)
+            insufficient = len(item_rows) != len(item_ids)
 
-        if len(rows) != len(item_ids):
-            response = -1
+            if not insufficient:
+                new_stocks = {}
 
-        if response == 0:
-            insufficient = False
-            new_stocks = {}
+                for row in item_rows:
+                    item_id = row['item_id']
+                    current_stock = row['stock']
+                    quantity_needed = quantity_map[item_id]
 
-            for row in rows:
-                item_id = row['item_id']
-                current_stock = row['stock']
-                quantity_needed = quantity_map[item_id]
+                    new_stock = current_stock - quantity_needed
+                    if new_stock < 0:
+                        insufficient = True
+                        break
+                    new_stocks[item_id] = new_stock
 
-                new_stock = current_stock - quantity_needed
-                if new_stock < 0:
-                    insufficient = True
-                    break
-                new_stocks[item_id] = new_stock
-
-
-            if insufficient:
-                response = -2
-
-        if response == 0:
+            if not insufficient:
                 for item_id, new_stock in new_stocks.items():
                     update_query = (
                         items_table.update()
@@ -215,57 +142,41 @@ async def on_order_paid(message: IncomingMessage):
 
                 stock_reserved_event = StockReservedEvent(
                     order_id=order_id,
+                    checkout_id=event.checkout_id,
                     user_id=user_id,
                     items=items,
                     total_cost=total_cost,
                     order_handling_service_id=event.order_handling_service_id
                 )
-                stmt = select(outbox_table).where(
-                    and_(
-                        outbox_table.c.aggregateid == order_id,
-                        outbox_table.c.type == "stock-reserved"
-                    )
+
+                insert_event = outbox_table.insert().values(
+                    id=uuid.uuid4(),
+                    aggregatetype="stock",
+                    aggregateid=order_id + event.checkout_id,
+                    type="stock-reserved",
+                    payload=msgspec.to_builtins(stock_reserved_event)
                 )
-                result = await database.fetch_one(stmt)
-
-                if not result:
-                    insert_event = outbox_table.insert().values(
-                        id=uuid.uuid4(),
-                        aggregatetype="stock",
-                        aggregateid=order_id,
-                        type="stock-reserved",
-                        payload=msgspec.to_builtins(stock_reserved_event)
-                    )
-                    await database.execute(insert_event)
-
-        else:
+                await database.execute(insert_event)
+            else:
                 insufficient_stock_event = InsufficientStockEvent(
                     order_id=order_id,
+                    checkout_id=event.checkout_id,
                     user_id=user_id,
                     items=items,
                     total_cost=total_cost,
                     order_handling_service_id=event.order_handling_service_id
                 )
 
-                stmt = select(outbox_table).where(
-                    and_(
-                        outbox_table.c.aggregateid == order_id,
-                        outbox_table.c.type == "insufficient-stock"
-                    )
+                insert_event = outbox_table.insert().values(
+                    id=uuid.uuid4(),
+                    aggregatetype="stock",
+                    aggregateid=order_id + event.checkout_id,
+                    type="insufficient-stock",
+                    payload=msgspec.to_builtins(insufficient_stock_event)
                 )
-                result = await database.fetch_one(stmt)
+                await database.execute(insert_event)
 
-                if not result:
-                    insert_event = outbox_table.insert().values(
-                        id=uuid.uuid4(),
-                        aggregatetype="stock",
-                        aggregateid=order_id,
-                        type="insufficient-stock",
-                        payload=msgspec.to_builtins(insufficient_stock_event)
-                    )
-                    await database.execute(insert_event)
-
-        await message.ack()
+    await message.ack()
 
 
 @app.post('/item/create/<price>')

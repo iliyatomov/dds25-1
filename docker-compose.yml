@@ -19,7 +19,7 @@ services:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@order-db:5432/order_db
-    command: gunicorn -b 0.0.0.0:5000 -w 1 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 8 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -34,8 +34,6 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=order_db
-    ports:
-      - 5432:5432
     volumes:
       - order-db:/var/lib/postgresql/data
     command: >
@@ -54,8 +52,8 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db:5434/stock_db
-    command: gunicorn -b 0.0.0.0:5000 -w 1 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@stock-db:5432/stock_db
+    command: gunicorn -b 0.0.0.0:5000 -w 8 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -70,17 +68,14 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=stock_db
-    ports:
-      - 5434:5434
     volumes:
       - stock-db:/var/lib/postgresql/data
     command: >
       postgres -c wal_level=logical
                -c max_replication_slots=10
                -c max_wal_senders=10
-               -c port=5434
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5434" ]
+      test: [ "CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 1s
       retries: 10
@@ -91,8 +86,8 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - RABBIT_URL=amqp://guest:guest@message-bus:5672/
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db:5433/payment_db
-    command: gunicorn -b 0.0.0.0:5000 -w 3 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@payment-db:5432/payment_db
+    command: gunicorn -b 0.0.0.0:5000 -w 8 -k uvicorn.workers.UvicornWorker --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -107,17 +102,14 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=payment_db
-    ports:
-      - 5433:5433
     volumes:
       - payment-db:/var/lib/postgresql/data
     command: >
       postgres -c wal_level=logical
                -c max_replication_slots=10
                -c max_wal_senders=10
-               -c port=5433
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -p 5433"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 1s
       retries: 10
@@ -140,8 +132,6 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/order.application.properties:/debezium/config/application.properties:readonly
-    ports:
-      - "8083:8083"
     depends_on:
       message-bus:
         condition: service_healthy
@@ -152,8 +142,6 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/stock.application.properties:/debezium/config/application.properties:readonly
-    ports:
-      - "8085:8085"
     depends_on:
       message-bus:
         condition: service_healthy
@@ -164,8 +152,6 @@ services:
     image: quay.io/debezium/server:3.1.0.Final
     volumes:
       - ./debezium-config/payment.application.properties:/debezium/config/application.properties:readonly
-    ports:
-      - "8084:8084"
     depends_on:
       message-bus:
         condition: service_healthy

@@ -10,8 +10,9 @@ import msgspec
 import sqlalchemy
 import requests
 
-from msgspec import msgpack, Struct
+from msgspec import Struct
 from quart import Quart, jsonify, abort, Response
+from sqlalchemy import select, and_
 
 from infrastructure import RabbitClient, IncomingMessage, EventWaiter
 from events import StockReservedEvent, OrderPlacedEvent, OrderCancelledEvent
@@ -62,6 +63,7 @@ outbox_table = sqlalchemy.Table(
     sqlalchemy.Column("aggregateid", sqlalchemy.String(255), nullable=False, index=True),
     sqlalchemy.Column("type", sqlalchemy.String(255), nullable=False),
     sqlalchemy.Column("payload", sqlalchemy.JSON),
+    sqlalchemy.UniqueConstraint("aggregateid", "type", name="uq_outbox_aggregateid_type")
 )
 
 class OrderValue(Struct):
@@ -71,14 +73,15 @@ class OrderValue(Struct):
     total_cost: int
 
 async def get_order_from_db(order_id: str) -> OrderValue | None:
-    query = sqlalchemy.select(
-            orders_table.c.id,
-            orders_table.c.paid,
-            orders_table.c.user_id,
-            orders_table.c.total_cost,
-            items_table.c.item_id,
-            items_table.c.quantity
-        ).where(orders_table.c.id == order_id).outerjoin(items_table, orders_table.c.id == items_table.c.order_id)
+    query = select(
+        orders_table.c.id,
+        orders_table.c.paid,
+        orders_table.c.status,
+        orders_table.c.user_id,
+        orders_table.c.total_cost,
+        items_table.c.item_id,
+        items_table.c.quantity
+    ).where(orders_table.c.id == order_id).outerjoin(items_table, orders_table.c.id == items_table.c.order_id)
     rows = await database.fetch_all(query)
 
     if len(rows) == 0:
@@ -99,21 +102,19 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
 @app.before_serving
 async def startup():
     await database.connect();
-
-    # await database.execute("DROP TABLE IF EXISTS items CASCADE")
-    # await database.execute("DROP TABLE IF EXISTS orders CASCADE")
-    # await database.execute("DROP TABLE IF EXISTS outbox CASCADE")
     
     for table in metadata.tables.values():
         schema = sqlalchemy.schema.CreateTable(table, if_not_exists=True)
         query = str(schema.compile(dialect=dialect))
         await database.execute(query=query)
 
-
     await rabbit_client.start()
 
-    asyncio.create_task(rabbit_client.subscribe(f'stock-reserved-{service_id}', on_stock_reserved))
-    asyncio.create_task(rabbit_client.subscribe(f'order-cancelled-{service_id}', on_order_cancelled))
+    asyncio.create_task(rabbit_client.subscribe(f'stock-reserved', on_stock_reserved))
+    asyncio.create_task(rabbit_client.subscribe(f'order-cancelled', on_order_cancelled))
+
+    asyncio.create_task(rabbit_client.subscribe(f'order-completed-{service_id}', on_completed_reserved_response))
+    asyncio.create_task(rabbit_client.subscribe(f'order-cancelled-{service_id}', on_order_cancelled_response))
 
 
 @app.after_serving
@@ -121,36 +122,100 @@ async def shutdown():
     await database.disconnect()
 
 async def on_stock_reserved(message: IncomingMessage):
-    event = msgpack.decode(message.body, type=StockReservedEvent)
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=StockReservedEvent)
 
-    # TODO
-    # in transaction:
-    # check if outbox table already has the event that this will produce on completion
-    # if it does => acknowledge the message and return
-    # if it does not => update the order to paid and insert the event into the outbox table; acknowledge the message
+    async with database.transaction():
+        event_query = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id + event.checkout_id,
+                outbox_table.c.type.in_([f"order-completed-{event.order_handling_service_id}"]),
+            )
+        )
 
-    query = orders_table.update().where(orders_table.c.id == event.order_id).values(paid=True)
+        sent_event = await database.fetch_one(event_query)
+        if sent_event is not None:
+            app.logger.info(f"on_stock_reserved already processed for order={event.order_id}")
+        else:
+            query = select().where(orders_table.c.id == event.order_id).with_for_update()
+            item_row = await database.fetch_one(query=query)
+            if item_row is None:
+                app.logger.info(f"Order {event.order_id} not found")
+            else:
+                update_order_status = orders_table.update().where(orders_table.c.id == event.order_id).values(paid=True, status="paid")
+                await database.execute(update_order_status)
 
-    try:
-        await database.execute(query)
-        event_waiter.trigger_event(event.order_id, event.order_id)
-    except Exception as e:
-        event_waiter.trigger_event(event.order_id, None) # TODO: consider reverting order if trigger_event returns False
+                event_data = {
+                    "id": uuid.uuid4(),
+                    "aggregatetype": "order",
+                    "aggregateid": event.order_id + event.checkout_id,
+                    "type": f"order-completed-{event.order_handling_service_id}",
+                    "payload": msgspec.to_builtins(event)
+                }
+                insert_event = outbox_table.insert().values(**event_data)
+                await database.execute(insert_event)
+
+    await message.ack()
+
+
+async def on_completed_reserved_response(message: IncomingMessage):
+    # the message handler does not interact with the database, so we can just acknowledge the message and return the response to the user
+    # if this fails, we won't be able to send the response to the user anyway, so we can just ignore it
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=StockReservedEvent)
+
+    event_waiter.trigger_event(event.order_id, event.order_id)
 
     await message.ack()
 
 
 async def on_order_cancelled(message: IncomingMessage):
-    event = msgpack.decode(message.body, type=OrderCancelledEvent)
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=OrderCancelledEvent)
+
+    async with database.transaction():
+        event_query = select(outbox_table).where(
+            and_(
+                outbox_table.c.aggregateid == event.order_id + event.checkout_id,
+                outbox_table.c.type.in_([f"order-cancelled-{event.order_handling_service_id}"]),
+            )
+        )
+
+        sent_event = await database.fetch_one(event_query)
+        if sent_event is not None:
+            app.logger.info(f"on_order_cancelled already processed for order={event.order_id}")
+        else:
+            query = select().where(orders_table.c.id == event.order_id).with_for_update()
+            item_row = await database.fetch_one(query=query)
+            if item_row is None:
+                app.logger.info(f"Order {event.order_id} not found")
+            else:
+                update_order_status = orders_table.update().where(orders_table.c.id == event.order_id).values(status="none")
+                await database.execute(update_order_status)
+
+                event_data = {
+                    "id": uuid.uuid4(),
+                    "aggregatetype": "order",
+                    "aggregateid": event.order_id + event.checkout_id,
+                    "type": f"order-cancelled-{event.order_handling_service_id}",
+                    "payload": msgspec.to_builtins(event)
+                }
+                insert_event = outbox_table.insert().values(**event_data)
+                await database.execute(insert_event)
+
+    await message.ack()
+    
+
+async def on_order_cancelled_response(message: IncomingMessage):
+    # the message handler does not interact with the database, so we can just acknowledge the message and return the response to the user
+    # if this fails, we won't be able to send the response to the user anyway, so we can just ignore it
+    event = msgspec.json.decode(json.loads(message.body.decode("utf-8")), type=OrderCancelledEvent)
 
     event_waiter.trigger_event(event.order_id, None)
 
     await message.ack()
-    
+
 @app.post('/create/<user_id>')
 async def create_order(user_id: str):
     key = str(uuid.uuid4())
-    query = orders_table.insert().values(id=key, user_id=user_id, paid=False, total_cost=0)
+    query = orders_table.insert().values(id=key, user_id=user_id, paid=False, total_cost=0, status="none")
     await database.execute(query=query)
     return jsonify({'order_id': key})
 
@@ -241,24 +306,48 @@ async def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
 
     async with database.transaction():
-        order_entry = await get_order_from_db(order_id)
+        query = select(
+            orders_table.c.id,
+            orders_table.c.paid,
+            orders_table.c.status,
+            orders_table.c.user_id,
+            orders_table.c.total_cost,
+            items_table.c.item_id,
+            items_table.c.quantity
+        ).where(orders_table.c.id == order_id).outerjoin(items_table, orders_table.c.id == items_table.c.order_id)
+        rows = await database.fetch_all(query)
+
+        if len(rows) == 0:
+            abort(400, f"Order: {order_id} not found!")
+        if rows[0]["paid"]:
+            return Response("Checkout successful", status=200)
+        if rows[0]["status"] != "none":
+            abort(400, f"Order: {order_id} already in progress!")
+
+        items_list = [(row["item_id"], row["quantity"]) for row in rows if "item_id" in row and row["item_id"] is not None]
+
+        order_value = OrderValue(
+            paid=rows[0]["paid"],
+            items=items_list,
+            user_id=rows[0]["user_id"],
+            total_cost=rows[0]["total_cost"]
+        )
 
         update_order_status = orders_table.update().where(orders_table.c.id == order_id).values(status="checkout_started")
         await database.execute(update_order_status)
         
-        event = OrderPlacedEvent(order_id=order_id, user_id=order_entry.user_id, items=order_entry.items, total_cost=order_entry.total_cost, order_handling_service_id=service_id)
+        checkout_id = str(uuid.uuid4())
+
+        event = OrderPlacedEvent(order_id=order_id, checkout_id=checkout_id, user_id=order_value.user_id, items=order_value.items, total_cost=order_value.total_cost, order_handling_service_id=service_id)
         event_data = {
             "id": uuid.uuid4(),
             "aggregatetype": "order",
-            "aggregateid": order_id,
+            "aggregateid": order_id + checkout_id,
             "type": "order-placed",
             "payload": msgspec.to_builtins(event)
         }
         insert_event = outbox_table.insert().values(**event_data)
         await database.execute(insert_event)
-        app.logger.info(f"Order placed event: {event}")
-
-    app.logger.info(f"Order entry: {order_entry}")
    
     data = await event_waiter.wait_for_event(order_id)
     if data is None:
