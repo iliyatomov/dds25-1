@@ -1,30 +1,19 @@
-# Web-scale Data Management Project Template
+### Architecture overview
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+We've implemented an asynchronous, choreographed SAGA pattern with eventual consistency. Services react to messages via RabbitMQ and perform local transactions that atomically persist both state changes and event records (the outbox pattern). To support ACID guarantees, we've migrated to PostgreSQL. 
 
-### Project structure
+The events/messages are published using change data capture via Debezium Server, ensuring reliable delivery even during service failures. And our architecture relies on the guarantee for the delivery that comes from the message bus to ensure eventual consistency.
 
-* `env`
-    Folder containing the Redis env variables for the docker-compose deployment
-    
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
-        
-* `k8s`
-    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
-    
-* `order`
-    Folder containing the order application logic and dockerfile. 
-    
-* `payment`
-    Folder containing the payment application logic and dockerfile. 
+Each message handler follows this pattern (within a single transaction):
+- Check if the message has already been processed. If yes, acknowledge and return.
+- Execute business logic and persist an event marking the action taken (or compensation step).
+- Acknowledge the message.
 
-* `stock`
-    Folder containing the stock application logic and dockerfile. 
+The system maintains eventual consistency despite container failures and has zero-downtime if one of the microservice containers has failed. To support that we have put a gateway that balances the traffic of HTTP requests and automatically stops routing requests to a faulty service. However, the system availability depends on the databases, message broker, CDCs, and gateway. On their failure, restarting the faulty container should return the system to full functionality and consistency.
 
-* `test`
-    Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
+The order service simulates synchronous behaviour by blocking the HTTP request until either a timeout occurs or an event confirms order success or failure. If the gateway or the order service handling the current checkout HTTP request fails, the checkout will still be completed (if there is enough money and stock), even though it is not possible to return a proper response to the HTTP request.
+
+If the databases, message broker or CDCs are down, all events will be delayed until they are operational. All checkouts that have already started (marked as started in the databases) will be completed once they are up again.
 
 ### Deployment types:
 
